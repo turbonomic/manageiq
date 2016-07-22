@@ -1,18 +1,20 @@
 ###################################
 #
-# EVM Automate Method: best_fit_with_scope
+# EVM Automate Method: best_fit_with_scope (using VMTurbo Operations Manager)
 #
-# Notes: This method is used to find all hosts, datastores that have the tag category
-# prov_scope = 'all' &&|| prov_scope = <group-name>
+# Notes: This method connects to a VMTurbo Operations Manager to request Host and Datastore 
+# placement recommendations for a VM.  It requires VMTurbo credentials, which are currently 
+# hard-coded in this method as global variables .
 #
 ###################################
 begin
-  @method = 'best_fit_with_scope'
+  LOG_PREFIX = "*** VMTurbo *** "
+  @method = LOG_PREFIX + 'best_fit_with_scope'
   $evm.log("info", "#{@method} - EVM Automate Method: <#{@method}> Started")
 
-  # Turn of verbose logging
+  # Turn on verbose logging
   @debug = true
-
+  
   #
   # Get variables
   #
@@ -24,205 +26,327 @@ begin
   ems  = vm.ext_management_system
   raise "#{@method} - EMS not found for VM:<#{vm.name}>" if ems.nil?
 
-  # Log space required
-  # $evm.log("info", "VM=<#{vm.name}>, Space Required=<#{vm.provisioned_storage}>")
-
   attrs = $evm.object.attributes
-  tags  = {}
+  
   #############################
-  # Get Tags that are in scope
-  # Default is to look for Hosts and Datastores tagged with prov_scope = All or match to Group
+  # VMTurbo additions - start
   #############################
-  tags["prov_scope"] = ["all", user.normalized_ldap_group]
+  require 'nokogiri'
+  require "net/http"
+  require "uri"
 
-  $evm.log("info", "#{@method} - VM=<#{vm.name}>, Space Required=<#{vm.provisioned_storage}>, group=<#{user.normalized_ldap_group}>") if @debug
+  # Global Constants
 
-  #############################
-  # STORAGE LIMITATIONS
-  #############################
-  STORAGE_MAX_VMS      = 0
-  storage_max_vms      = $evm.object['storage_max_vms']
-  storage_max_vms      = storage_max_vms.strip.to_i if storage_max_vms.kind_of?(String) && !storage_max_vms.strip.empty?
-  storage_max_vms      = STORAGE_MAX_VMS unless storage_max_vms.kind_of?(Numeric)
-  STORAGE_MAX_PCT_USED = 100
-  storage_max_pct_used = $evm.object['storage_max_pct_used']
-  storage_max_pct_used = storage_max_pct_used.strip.to_i if storage_max_pct_used.kind_of?(String) && !storage_max_pct_used.strip.empty?
-  storage_max_pct_used = STORAGE_MAX_PCT_USED unless storage_max_pct_used.kind_of?(Numeric)
-  $evm.log("info", "#{@method} - storage_max_vms:<#{storage_max_vms}> storage_max_pct_used:<#{storage_max_pct_used}>") if @debug
+  # VMTurbo server credentials (TODO: Put these in a conf file and read them in at run time.)
+  $vmt_host = "VMTurbo_IP_address"
+  $vmt_username = "VMTurbo_username"
+  $vmt_password = "VMTurbo_password"
 
-  #############################
-  # Set host sort order here
-  # options: :active_provioning_memory, :active_provioning_cpu, :current_memory_usage,
-  #          :current_memory_headroom, :current_cpu_usage, :random
-  #############################
-  HOST_SORT_ORDER = [:active_provioning_memory, :current_memory_headroom, :random]
+  ##
+  # VMTScheduler Class
+  #
+  # Calls the VMTurbo Scheduler API, requesting a Host and Storage placement recommendation for a VM.
+  # The VMTurbo Scheduler URL and credentials must be passed to an instance of this class.
+  #
+  # == Attributes
+  #
+  # * +vmt_host+     - IP address or Host name of the VMTurbo server
+  # * +vmt_username+ - a VMTurbo username with admin role
+  # * +vmt_password+ - the password associated with the VMTurbo username
+  #
+  class VMTurboScheduler
 
-  #############################
-  # Sort hosts
-  #############################
-  active_prov_data = prov.check_quota(:active_provisions)
-  sort_data = []
+    ##
+    # Constants
+    #
+    # VMTurbo Rest API resources
+    VMT_API = "/vmturbo/api/"
+    VMT_RESOURCE_RESERVATIONS = "reservations"
+    VMT_RESOURCE_TEMPLATES = "templates"
+
+    # poll for placement results every 2 seconds for up to 5 minutes
+    VMT_SECONDS_BETWEEN_POLLS = 2
+    VMT_NUM_POLLS = 150
+
+    ##
+    # Utility methods
+    #
+    def log(level, message)
+      $evm.log(level, LOG_PREFIX + message)
+    end
+
+    ##
+    # Intializes the VMTurbo server credentials.
+    #
+    # Params:
+    # +vmt_host+     - IP address or Host name of the VMTurbo server
+    # +vmt_username+ - a VMTurbo username with admin role
+    # +vmt_password+ - the password associated with the VMTurbo username
+    #
+    def initialize(vmt_host, vmt_username, vmt_password)
+      @vmt_host = vmt_host
+      @vmt_username = vmt_username
+      @vmt_password = vmt_password
+    end
+
+    ##
+    # Accesses a VMTurbo Rest resource (with Get, Post or Delete) and returns the received Net::HTTPResponse object.
+    #
+    #--
+    # TODO: Handle SSL, Host Port and possibly add special check for authentication errors.
+    #
+    def api_call(resource, request, operation_type_string)
+      http = Net::HTTP.new(@vmt_host)
+      log("debug", "#{operation_type_string} VMTurbo resource: " + VMT_API + resource)
+      request.basic_auth(@vmt_username, @vmt_password)
+      response = http.request(request)
+      if (! response.is_a? Net::HTTPSuccess)
+        raise "Error from VMTurbo server: #{response.class.name}, #{response.code}, #{response.message}"
+      end
+      log("debug", "... VMTurbo response received: #{response.class.name}, #{response.code}, #{response.body}")
+      return response
+    end
+
+    ##
+    # Retrieves a VMTurbo resource using Rest API and returns a Nokogiri::HTML::Document object containing the response body.
+    #
+    def api_get(resource)
+      request = Net::HTTP::Get.new(VMT_API + resource)
+      response = api_call(resource, request, "Getting")
+      doc = Nokogiri::XML(response.body)   
+      return doc
+    end
+
+    ##
+    # Deletes a VMTurbo resource and returns the response body.
+    #
+    def api_delete(resource)
+      request = Net::HTTP::Delete.new(VMT_API + resource)
+      response = api_call(resource, request, "Deleting")
+      return response.body
+    end
+
+    ##
+    # Posts data to a VMTurbo resource and returns the response body.
+    #
+    def api_post(resource, request_data)
+      request = Net::HTTP::Post.new(VMT_API + resource)
+      request.set_form_data(request_data)
+      response = api_call(resource, request, "Posting")
+      return response.body
+    end
+    
+    ##
+    # Requests a VMTurbo reservation and returns the reservation ID generated by VMTurbo.
+    #
+    # Params:
+    # +template_uuid+           - the Virtual Machine Profile Uuid (= OpenStack Flavor)
+    # +deployment_profile_uuid+ - the Service Catalog Item Uuid (= OpenStack Image)
+    #
+    #--
+    # TODO: Handle VM Anti/Affinity groups
+    #
+    def request_placement(reservationName, vmPrefix, template_uuid, deployment_profile_uuid, vmCount)
+      log("info", "Creating reservation: " + 
+          "vmPrefix=" + vmPrefix + ", " +
+          "template_uuid=" + template_uuid + ", " +
+          "deployment_profile_uuid=" + deployment_profile_uuid + ", " +
+          "count=" + vmCount.to_s)
+      requests_data_dict = { 
+        "vmPrefix" => vmPrefix, 
+        "reservationName" => reservationName,
+        "templateName" => template_uuid,
+        "deploymentProfile" => deployment_profile_uuid,
+        "count" => vmCount.to_s
+      }
+      reservation_uuid = api_post("reservations", requests_data_dict)
+      reservation_uuid.strip!
+      raise "Reservation not generated by VMTurbo for #{template_uuid}/#{vmPrefix}" if reservation_uuid == ""
+      log("debug", "... Reservation created: " + reservation_uuid)
+      return reservation_uuid
+    end
+
+    ##
+    # Returns the current status of a placement request.
+    #
+    def get_placement_status(reservation_uuid)
+      log("debug", "Getting status of reservation: |" + reservation_uuid + "|")
+      doc = api_get VMT_RESOURCE_RESERVATIONS
+
+      reservation_xpath = "//TopologyElement[@creationClassName='Reservation'][@uuid='#{reservation_uuid}']"
+      status = ''
+      nodes = doc.xpath(reservation_xpath)
+      raise "Reservation not found with uuid #{reservation_uuid}" if (nodes.size < 1)
+      nodes.each do |node|
+        log("debug", "... Got status for Reservation uuid: " + node["uuid"] + ", status: " + node["status"])
+        status = node['status']
+      end
+      return status
+    end
+
+    ##
+    # Returns the resources selected by VMTurbo for the placement request.
+    #
+    def get_placement_resources(reservation_uuid)
+      log("debug", "Getting resources for reservation: " + reservation_uuid)
+      doc = api_get VMT_RESOURCE_RESERVATIONS + '/' + reservation_uuid
+
+      resources_xpath = "//ActionItem"
+      host = ''
+      datastore = ''
+      nodes = doc.xpath(resources_xpath)
+      raise "Resources not found for reservation with uuid #{reservation_uuid}" if (nodes.size < 1)
+      nodes.each do |node|
+        log("debug", "... Got resources for Reservation name: " + node["name"] + ", host: " + node["host"] + ", datastore: " + node["datastore"])
+        host = node["host"]
+        datastore = node["datastore"]
+      end
+      return host, datastore		
+    end
+    
+    ##
+    # Deletes the reservation associated with a placement request.
+    #
+    def delete_placement(reservation_uuid)
+      log("debug", "Deleting reservation: " + reservation_uuid)
+      response = api_delete("reservations/" + reservation_uuid)
+      response.strip!
+      log("debug", "... Delete request for reservation " + reservation_uuid + " returned: " + response)
+      return response
+    end
+    
+    ##
+    # Returns the VMTurbo uuids of the template and deployment profiles corresponding to a template name.
+    #
+    #--
+    # TODO: implement xpath "ends-with" and use with template name
+    #
+    def get_template_uuid_and_deployment_profile_uuid(template_name)
+      log("debug", "Getting template uuid and deployment profile uuid for " + template_name)
+      doc = api_get(VMT_RESOURCE_TEMPLATES)
+      
+      template_xpath = "//TopologyElement[@creationClassName='VirtualMachineProfile'][contains(@displayName,'::TMP-#{template_name}')]"
+      template_uuid = ''
+      deployment_profile_uuid = ''
+      nodes = doc.xpath(template_xpath)
+      raise "Template not found with name  #{template_name}" if (nodes.size < 1)
+      nodes.each do |node|
+        log("debug", "... Got template uuid " + node["uuid"] + " and deployment profile uuid " + node["services"])
+        template_uuid = node["uuid"]
+        deployment_profile_uuid = node["services"]
+      end
+      return template_uuid, deployment_profile_uuid
+    end
+    
+    ##
+    # Waits for the VMTurbo placement request to complete and returns the recommended resource placements.
+    #
+    def poll_for_status(reservation_uuid)
+      statusRes = ''
+      host = ''
+      datastore = ''
+      count = 0	
+      
+      log("debug", "Waiting up to #{(VMT_NUM_POLLS*VMT_SECONDS_BETWEEN_POLLS).to_s} seconds for reservation #{reservation_uuid} request to complete: ")
+      # wait for the placement request to complete
+      while (statusRes == "" or statusRes == "LOADING" or statusRes == "UNFULFILLED")
+        count += 1
+        if (count > VMT_NUM_POLLS)
+          log("warn", "Placement request did not complete in " + (VMT_NUM_POLLS*VMT_SECONDS_BETWEEN_POLLS).to_s + " seconds")
+          break
+        end
+        statusRes = get_placement_status(reservation_uuid)
+        log("debug", "Count: " + count.to_s + ", status: " + statusRes + ", res: " + reservation_uuid)
+        sleep(VMT_SECONDS_BETWEEN_POLLS)
+      end
+      
+      # get the placement results
+      if (statusRes == "PLACEMENT_SUCCEEDED")
+        log("debug", "Placement request " + reservation_uuid + " succeeded")
+        host, datastore = get_placement_resources(reservation_uuid)
+      elsif (statusRes == "PLACEMENT_FAILED")
+        log("warn", "Placement request " + reservation_uuid + " could not be satisfied with existing resources")
+      else
+        log("warn", "Placement request " + reservation_uuid + " did not complete: " + statusRes)
+      end
+      
+      return statusRes, host, datastore
+    end
+
+    ##
+    # Requests a VMTurbo placement recommendation and returns the VMTurbo reservation request uuid.
+    #
+    def request_recommendation(reservation_name, vmPrefix, template_name, vmCount)
+      log("debug", "Creating reservation: " + reservation_name + ", " +
+          "vmPrefix: " + vmPrefix + ", " +
+          "template_name: " + template_name + ", " +
+          "count: " + vmCount.to_s)
+      
+      log("debug", "-- Get Template & Deployment Profile --")
+      template_uuid, deployment_profile_uuid = self.get_template_uuid_and_deployment_profile_uuid(template_name)
+      log("debug", "Template uuid for " + template_name + ": " + template_uuid)
+      log("debug", "Deployment Profile uuid for " + template_name + ": " + deployment_profile_uuid)
+
+      log("debug", "-- Create Reservation--")
+      reservation_uuid = self.request_placement(reservation_name, vmPrefix, template_uuid, deployment_profile_uuid, vmCount)
+      log("debug", "Reservation uuid: " + reservation_uuid)
+
+      log("debug", "-- Poll and Get Resources --")
+      status_res, host, datastore = self.poll_for_status(reservation_uuid)
+      log("debug", "Status of reservation #{reservation_uuid}: " + status_res)
+      log("debug", "Reservation resources for #{reservation_uuid}: Host: " + host + ", datastore: " + datastore)
+
+      log("debug", "-- Delete --")
+      deleted = self.delete_placement(reservation_uuid)
+      log("debug", "Delete reservation " + reservation_uuid + " returned: " + deleted)
+
+      return status_res, host, datastore
+    end
+
+  end # class VMTurboScheduler 
+
+  #
+  # Instantiate a VMTScheduler and request a VM placement recommendation
+  #
+  vmt_sched = VMTurboScheduler.new($vmt_host, $vmt_username, $vmt_password)
+  
+  VM_COUNT = 1              # MIQ handles larger requests as a series of individual requests
+  template_name = vm.name                                 # "SUSE64"         # the template name 
+  vm_prefix = "MIQ-#{prov.get_option(:vm_name)}"          # "MIQ-vm-10"      # the user-supplied name
+  reservation_name = "MIQ-Request-#{prov.miq_request_id}" # "MIQ-Request-10" # the MIQ request ID
+
+  status_res, vmt_host_name, vmt_storage_name = vmt_sched.request_recommendation(reservation_name, vm_prefix, template_name, VM_COUNT)
+
+  $evm.log("info", LOG_PREFIX + "Reservation resources: Status: " + status_res + " Host: " + vmt_host_name + ", Datastore:" + vmt_storage_name) if @debug
+
+  #
+  # Find the MIQ Host and Datastore objects correpesonding to the VMTurbo recommendations
+  #
+  host = storage = nil
+
   ems.hosts.each do |h|
-    sort_data << sd = [[], h.name, h]
-    host_id = h.attributes['id'].to_i
-    HOST_SORT_ORDER.each do |type|
-      sd[0] << case type
-               # Multiply values by (-1) to cause larger values to sort first
-               when :active_provioning_memory
-                 active_prov_data[:active][:memory_by_host_id][host_id]
-               when :active_provioning_cpu
-                 active_prov_data[:active][:cpu_by_host_id][host_id]
-               when :current_memory_headroom
-                 h.current_memory_headroom * -1
-               when :current_memory_usage
-                 h.current_memory_usage
-               when :current_cpu_usage
-                 h.current_cpu_usage
-               when :random
-                 rand(1000)
-               else 0
-               end
+    if vmt_host_name.casecmp(h.name) == 0
+      host = h
+      break
     end
   end
-
-  sort_data.sort! { |a, b| a[0] <=> b[0] }
-  hosts = sort_data.collect { |sd| sd.pop }
-  $evm.log("info", "#{@method} - Sorted host Order:<#{HOST_SORT_ORDER.inspect}> Results:<#{sort_data.inspect}>") if @debug
-
-  #############################
-  # Set storage sort order here
-  # options: :active_provisioning_vms, :free_space, :free_space_percentage, :random
-  #############################
-  STORAGE_SORT_ORDER = [:active_provisioning_vms, :random]
-
-  host = storage = nil
-  min_registered_vms = nil
-  hosts.each do |h|
-    next unless h.power_state == "on"
-
-    #############################
-    # Only consider hosts that have the required tags
-    #############################
-    next unless tags.all? do |key, value|
-      if value.kind_of?(Array)
-        value.any? { |v| h.tagged_with?(key, v) }
-      else
-        h.tagged_with?(key, value)
+  
+  $evm.log("info", LOG_PREFIX + "Host:<#{host.nil? ? "nil" : host.name}>") if @debug
+  
+  if !host.nil?
+    host.storages.each do |s|
+      if vmt_storage_name.casecmp(s.name) == 0
+        storage = s
+        break
       end
     end
+  end
+  
+  $evm.log("info", LOG_PREFIX + "Storage:<#{storage.nil? ? "nil" : storage.name}>") if @debug  
 
-    nvms = h.vms.length
-
-    #############################
-    # Only consider storages that have the tag category group=all
-    #############################
-    storages = h.storages.select do |s|
-      tags.all? do |key, value|
-        if value.kind_of?(Array)
-          value.any? { |v| s.tagged_with?(key, v) }
-        else
-          s.tagged_with?(key, value)
-        end
-      end
-    end
-
-    $evm.log("info", "#{@method} - Evaluating storages:<#{storages.collect { |s| s.name }.join(", ")}>") if @debug
-
-    #############################
-    # Filter out storages that do not have enough free space for the VM
-    #############################
-    active_prov_data = prov.check_quota(:active_provisions)
-    storages = storages.select do |s|
-      storage_id = s.attributes['id'].to_i
-      actively_provisioned_space = active_prov_data[:active][:storage_by_id][storage_id]
-      if s.free_space > vm.provisioned_storage + actively_provisioned_space
-        #        $evm.log("info", "Active Provision Data inspect: [#{active_prov_data.inspect}]")
-        #        $evm.log("info", "Active provision space requirement: [#{actively_provisioned_space}]")
-        #        $evm.log("info", "Valid Datastore: [#{s.name}], enough free space for VM -- Available: [#{s.free_space}], Needs: [#{vm.provisioned_storage}]")
-        true
-      else
-        $evm.log("info", "#{@method} - Skipping Datastore:<#{s.name}>, not enough free space for VM:<#{vm.name}>. Available:<#{s.free_space}>, Needs:<#{vm.provisioned_storage}>") if @debug
-        false
-      end
-    end
-
-    #############################
-    # Filter out storages number of VMs is greater than the max number of VMs allowed per Datastore
-    #############################
-    storages = storages.select do |s|
-      storage_id = s.attributes['id'].to_i
-      active_num_vms_for_storage = active_prov_data[:active][:vms_by_storage_id][storage_id].length
-      if (storage_max_vms == 0) || ((s.vms.size + active_num_vms_for_storage) < storage_max_vms)
-        true
-      else
-        $evm.log("info", "#{@method} - Skipping Datastore:<#{s.name}>, max number of VMs:<#{s.vms.size + active_num_vms_for_storage}> exceeded") if @debug
-        false
-      end
-    end
-
-    #############################
-    # Filter out storages where percent used will be greater than the max % allowed per Datastore
-    #############################
-    storages = storages.select do |s|
-      storage_id = s.attributes['id'].to_i
-      active_pct_of_storage  = ((active_prov_data[:active][:storage_by_id][storage_id]) / s.total_space.to_f) * 100
-      request_pct_of_storage = (vm.provisioned_storage / s.total_space.to_f) * 100
-
-      #      $evm.log("info", "Active Provision Data inspect: [#{s.name}]:[#{storage_id}] -- [#{active_prov_data.inspect}]")
-      #      $evm.log("info", "Datastore Percent: [#{s.name}]:[#{storage_id}] -- Storage:[#{s.v_used_space_percent_of_total}]  Active:[#{active_pct_of_storage}]  Request:[#{request_pct_of_storage}]")
-
-      if (storage_max_pct_used == 100) || ((s.v_used_space_percent_of_total + active_pct_of_storage + request_pct_of_storage) < storage_max_pct_used)
-        #        $evm.log("info", "Current PCT of active provision: [#{active_pct_of_storage}]")
-        #        $evm.log("info", "Valid Datastore: [#{s.name}], enough free space for VM -- Total Datastore Size: [#{s.total_space}], Available: [#{s.free_space}], Needs: [#{vm.provisioned_storage}]")
-        true
-      else
-        $evm.log("info", "#{@method} - Skipping Datastore:<#{s.name}> percent of used space #{s.v_used_space_percent_of_total + active_pct_of_storage + request_pct_of_storage} exceeded") if @debug
-        #        $evm.log("info", "Total Datastore Size: [#{s.total_space}], Total Percentage Required: ([#{s.v_used_space_percent_of_total}] + [#{active_pct_of_storage}])")
-        false
-      end
-    end
-
-    if min_registered_vms.nil? || nvms < min_registered_vms
-      #############################
-      # Sort storage to determine target datastore
-      #############################
-      sort_data = []
-      storages.each_with_index do |s, idx|
-        sort_data << sd = [[], s.name, idx]
-        storage_id = s.attributes['id'].to_i
-        STORAGE_SORT_ORDER.each do |type|
-          sd[0] << case type
-                   when :free_space
-                     # Multiply values by (-1) to cause larger values to sort first
-                     (s.free_space - active_prov_data[:active][:storage_by_id][storage_id]) * -1
-                   when :free_space_percentage
-                     active_pct_of_storage  = ((active_prov_data[:active][:storage_by_id][storage_id]) / s.total_space.to_f) * 100
-                     s.v_used_space_percent_of_total + active_pct_of_storage
-                   when :active_provioning_vms
-                     active_prov_data[:active][:vms_by_storage_id][storage_id].length
-                   when :random
-                     rand(1000)
-                   else 0
-                   end
-        end
-      end
-
-      sort_data.sort! { |a, b| a[0] <=> b[0] }
-      $evm.log("info", "#{@method} - Sorted storage Order:<#{STORAGE_SORT_ORDER.inspect}>  Results:<#{sort_data.inspect}>") if @debug
-      selected_storage = sort_data.first
-      unless selected_storage.nil?
-        selected_idx = selected_storage.last
-        storage = storages[selected_idx]
-        host    = h
-      end
-
-      # $evm.log("info", "Found Host:<#{h.name}> with Tags:<#{h.tags.inspect}>") if @debug
-
-      # Stop checking if we have found both host and storage
-      break if host && storage
-    end
-
-  end # END - hosts.each
+  #########################
+  # VMTurbo additions - end
+  #########################  
 
   obj = $evm.object
   $evm.log("info", "#{@method} - Selected Host:<#{host.nil? ? "nil" : host.name}>") if @debug
@@ -247,3 +371,4 @@ rescue => err
   $evm.log("error", "#{@method} - [#{err}]\n#{err.backtrace.join("\n")}")
   exit MIQ_ABORT
 end
+
